@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 import os
+
+from torch.nn.parallel import DistributedDataParallel as DDP
 # ===============================
 
 
@@ -247,9 +249,12 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoader:
-    def __init__(self, B, T):
+    def __init__(self, B, T, processRank, numProces):
         self.B = B
         self.T = T
+        self.processRank = processRank
+        self.numProces = numProces
+
 
         with open('/content/input.txt', 'r') as file:
             txt = file.read()
@@ -259,7 +264,8 @@ class DataLoader:
         print(f"loaded {len(tokens)} tokens")
         print(f"1 epoch = {len(tokens) // (B * T)} bathes")
 
-        self.currentPos = 0
+        #state
+        self.currentPos = B * T * self.processRank
 
     def nextBatch(self):
         B, T = self.B, self.T
@@ -268,14 +274,15 @@ class DataLoader:
         x = (buf[:-1].view(B, T))# input
         y = (buf[1:].view(B, T))# targt/lable
 
-        self.currentPos += B * T
+        self.currentPos += B * T * self.numProces
 
-        if self.currentPos + (B * T + 1) > len(self.tokens):
-            self.currentPos = 0
+        if self.currentPos + (B * T * self.numProces + 1) > len(self.tokens):
+            self.currentPos = self.B * self.T * self.processRank
+
         return x, y
 
 
-import time
+import tim
 
 device = 'cpu'
 if torch.cuda.is_available():
@@ -330,21 +337,25 @@ T = 1024 # seq len
 assert totalBatchSiz % (B * T * ddp_world_size) == 0, "make sure total batch Size is devisible by B * T * ddp_world_size"
 gradAccumStep = totalBatchSiz // (B * T * ddp_world_size)
 
-if master_process: # else This would Print x times Depending on how many GPUs you;ve
-    print(f'total desired batch siz: {totalBatchSiz}')
-    print(f"=> calc grad accum step: {gradAccumStep}")
+#if master_process: # else This would Print x times Depending on how many GPUs you;ve
+#    print(f'total desired batch siz: {totalBatchSiz}')
+#    print(f"=> calc grad accum step: {gradAccumStep}")
 
-trainLoader = DataLoader(B=8, T=512) #i ran out of mem
-
+trainLoader = DataLoader(B=B, T=T, processRank=ddp_rank, numProces=ddp_world_size) #i ran out of mem
+# B=8, T=512
 print("im GPU ", ddp_rank)
 import sys; sys.exit(0)
 
 # Enabeling  TF-32
 torch.set_float32_matmul_precision('high')
 
+# Create model
 model = GPT(GPTConfig(vocabSiz=50304)) # GPU like when it get num of pow of 2, even.,, 50304 is a pow of 2
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=(ddp_local_rank))
+
 
 #Cosine Decay
 maxLr = 6e-4
